@@ -1,0 +1,243 @@
+name: Certificate Update with Approval
+
+on:
+  schedule:
+    # 毎月1日の午前9時（JST）に実行
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '強制的に証明書を更新する'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: '環境を指定 (main/develop)'
+        required: false
+        type: string
+        default: ''
+      approval_action:
+        description: '承認アクション (approve/reject)'
+        required: false
+        type: string
+        default: ''
+      approval_id:
+        description: '承認ID'
+        required: false
+        type: string
+        default: ''
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  check-certificates:
+    runs-on: macos-latest
+    if: github.event.inputs.approval_action != 'approve' && github.event.inputs.approval_action != 'reject'
+    outputs:
+      needs_update: ${{ steps.check-expiry.outputs.needs_update }}
+      environment: ${{ steps.determine-env.outputs.environment }}
+      expiry_date: ${{ steps.check-expiry.outputs.expiry_date }}
+      days_remaining: ${{ steps.check-expiry.outputs.days_remaining }}
+      bundle_id: ${{ steps.get-bundle-id.outputs.bundle_id }}
+      approval_id: ${{ steps.generate-approval-id.outputs.approval_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: determine-env
+        run: |
+          if [ -n "${{ github.event.inputs.environment }}" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+            case "$BRANCH_NAME" in
+              "main")
+                ENVIRONMENT="main"
+                ;;
+              "develop")
+                ENVIRONMENT="develop"
+                ;;
+              *)
+                echo "警告: 未知のブランチ '$BRANCH_NAME'。デフォルト環境を使用します。"
+                ENVIRONMENT="main"
+                ;;
+            esac
+          fi
+          
+          echo "選択された環境: $ENVIRONMENT"
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 requests pyyaml PyJWT cryptography
+          brew install fastlane
+
+      - name: Get Bundle ID from Xcode project
+        id: get-bundle-id
+        run: |
+          python scripts/extract_bundle_id.py
+        env:
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+
+      - name: Retrieve App Store Connect API credentials
+        id: get-api-credentials
+        run: |
+          python scripts/get_api_credentials.py
+        env:
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+
+      - name: Check certificate expiry
+        id: check-expiry
+        run: |
+          python scripts/check_certificate_expiry.py
+        env:
+          FORCE_UPDATE: ${{ github.event.inputs.force_update }}
+          BUNDLE_ID: ${{ steps.get-bundle-id.outputs.bundle_id }}
+          BUNDLE_IDS: ${{ steps.get-bundle-id.outputs.bundle_ids }}
+          APP_STORE_CONNECT_KEY_ID: ${{ steps.get-api-credentials.outputs.key_id }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ steps.get-api-credentials.outputs.issuer_id }}
+          APP_STORE_CONNECT_KEY_PATH: ${{ steps.get-api-credentials.outputs.key_path }}
+
+      - name: Generate approval ID
+        id: generate-approval-id
+        if: steps.check-expiry.outputs.needs_update == 'true'
+        run: |
+          APPROVAL_ID=$(date +%s)-$(echo $RANDOM | md5sum | head -c 8)
+          echo "approval_id=$APPROVAL_ID" >> $GITHUB_OUTPUT
+
+      - name: Send approval request to Slack
+        if: steps.check-expiry.outputs.needs_update == 'true'
+        run: |
+          python scripts/send_approval_request.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+          BUNDLE_ID: ${{ steps.get-bundle-id.outputs.bundle_id }}
+          EXPIRY_DATE: ${{ steps.check-expiry.outputs.expiry_date }}
+          DAYS_REMAINING: ${{ steps.check-expiry.outputs.days_remaining }}
+          APPROVAL_ID: ${{ steps.generate-approval-id.outputs.approval_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip update notification
+        if: steps.check-expiry.outputs.needs_update == 'false'
+        run: |
+          echo "証明書の有効期限に余裕があります。更新は不要です。"
+
+  validate-approval:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.approval_action != ''
+    outputs:
+      approved: ${{ steps.validate.outputs.approved }}
+      action: ${{ steps.validate.outputs.action }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate approval
+        id: validate
+        run: |
+          python scripts/validate_approval.py
+        env:
+          APPROVAL_ACTION: ${{ github.event.inputs.approval_action }}
+          APPROVAL_ID: ${{ github.event.inputs.approval_id }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+  execute-update:
+    runs-on: macos-latest
+    needs: validate-approval
+    if: needs.validate-approval.outputs.approved == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 requests pyyaml PyJWT cryptography
+          brew install fastlane
+
+      - name: Get Bundle ID from Xcode project
+        id: get-bundle-id
+        run: |
+          python scripts/extract_bundle_id.py
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+      - name: Retrieve App Store Connect API credentials
+        id: get-api-credentials
+        run: |
+          python scripts/get_api_credentials.py
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+      - name: Update certificates
+        run: |
+          python scripts/update_certificates.py
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          BUNDLE_ID: ${{ steps.get-bundle-id.outputs.bundle_id }}
+          BUNDLE_IDS: ${{ steps.get-bundle-id.outputs.bundle_ids }}
+          APP_STORE_CONNECT_KEY_ID: ${{ steps.get-api-credentials.outputs.key_id }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ steps.get-api-credentials.outputs.issuer_id }}
+          APP_STORE_CONNECT_KEY_PATH: ${{ steps.get-api-credentials.outputs.key_path }}
+
+      - name: Upload certificates to AWS Secrets Manager
+        run: |
+          python scripts/upload_to_secrets_manager.py
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+      - name: Send success notification
+        if: success()
+        run: |
+          python scripts/send_slack_notification.py --status success --message "証明書の更新が正常に完了しました（承認ID: ${{ github.event.inputs.approval_id }}）"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+      - name: Send failure notification
+        if: failure()
+        run: |
+          python scripts/send_slack_notification.py --status failure --message "証明書の更新に失敗しました（承認ID: ${{ github.event.inputs.approval_id }}）"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+  handle-rejection:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.approval_action == 'reject'
+    steps:
+      - name: Send rejection notification
+        run: |
+          echo "証明書更新が拒否されました（承認ID: ${{ github.event.inputs.approval_id }}）"
+          # Slackに拒否通知を送信する場合はここに追加

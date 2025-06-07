@@ -1,0 +1,131 @@
+name: Test Certificate Approval Flow
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'テスト環境 (main/develop)'
+        required: false
+        type: string
+        default: 'main'
+      send_slack_notification:
+        description: 'Slack通知もテストする'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  test-approval-flow:
+    runs-on: ubuntu-latest
+    outputs:
+      approval_id: ${{ steps.test-flow.outputs.approval_id }}
+      environment: ${{ steps.test-flow.outputs.environment }}
+      bundle_id: ${{ steps.test-flow.outputs.bundle_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run approval flow test
+        id: test-flow
+        run: |
+          echo "🧪 承認フローのテストを実行します"
+          python scripts/test_approval_flow.py
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          FORCE_UPDATE: 'true'
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Send test Slack notification
+        if: github.event.inputs.send_slack_notification == 'true'
+        run: |
+          echo "📤 実際のSlack通知をテスト送信します"
+          python scripts/send_approval_request.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENVIRONMENT: ${{ steps.test-flow.outputs.environment }}
+          BUNDLE_ID: ${{ steps.test-flow.outputs.bundle_id }}
+          EXPIRY_DATE: ${{ steps.test-flow.outputs.expiry_date }}
+          DAYS_REMAINING: ${{ steps.test-flow.outputs.days_remaining }}
+          APPROVAL_ID: ${{ steps.test-flow.outputs.approval_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show test results
+        run: |
+          echo "✅ テスト完了！"
+          echo ""
+          echo "📋 生成された承認情報:"
+          echo "  承認ID: ${{ steps.test-flow.outputs.approval_id }}"
+          echo "  環境: ${{ steps.test-flow.outputs.environment }}"
+          echo "  Bundle ID: ${{ steps.test-flow.outputs.bundle_id }}"
+          echo ""
+          echo "🎯 次のステップ:"
+          echo "1. 承認テスト: Certificate Update with Approval ワークフローで手動実行"
+          echo "   - approval_action: approve"
+          echo "   - environment: ${{ steps.test-flow.outputs.environment }}"
+          echo "   - approval_id: ${{ steps.test-flow.outputs.approval_id }}"
+          echo ""
+          echo "2. 拒否テスト: 同じパラメータで approval_action を reject に変更"
+          echo ""
+          echo "3. 無効なIDテスト: 間違った approval_id でエラーハンドリングを確認"
+
+  test-validation:
+    runs-on: ubuntu-latest
+    needs: test-approval-flow
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Test approval validation (valid)
+        run: |
+          echo "✅ 有効な承認IDの検証テスト"
+          python scripts/validate_approval.py
+        env:
+          APPROVAL_ACTION: 'approve'
+          APPROVAL_ID: ${{ needs.test-approval-flow.outputs.approval_id }}
+          ENVIRONMENT: ${{ needs.test-approval-flow.outputs.environment }}
+
+      - name: Test approval validation (invalid ID)
+        run: |
+          echo "❌ 無効な承認IDの検証テスト（エラーが期待される）"
+          if python scripts/validate_approval.py; then
+            echo "⚠️  警告: 無効なIDが通ってしまいました"
+            exit 1
+          else
+            echo "✅ 正常: 無効なIDが正しく拒否されました"
+          fi
+        env:
+          APPROVAL_ACTION: 'approve'
+          APPROVAL_ID: 'invalid-test-id'
+          ENVIRONMENT: ${{ needs.test-approval-flow.outputs.environment }}
+
+      - name: Test summary
+        run: |
+          echo "🎉 承認フローのテストが完了しました！"
+          echo ""
+          echo "✅ 完了したテスト:"
+          echo "  - 承認リクエスト生成"
+          echo "  - 承認ID検証（有効）"
+          echo "  - 承認ID検証（無効）"
+          echo "  - エラーハンドリング"
+          echo ""
+          echo "🔄 手動テスト推奨:"
+          echo "  - Certificate Update with Approval ワークフローでの実際の承認"
+          echo "  - Slack通知の確認（send_slack_notification: trueで実行）"

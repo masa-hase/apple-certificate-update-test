@@ -1,0 +1,205 @@
+name: Update Apple Certificates
+
+on:
+  schedule:
+    # 毎月1日の午前9時（JST）に実行
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '強制的に証明書を更新する'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: '環境を指定 (main/develop)'
+        required: false
+        type: string
+        default: ''
+
+env:
+  AWS_REGION: ap-northeast-1  # 必要に応じて変更してください
+
+jobs:
+  check-and-update-certificates:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: determine-env
+        run: |
+          # 手動実行時に環境が指定されている場合はそれを使用
+          if [ -n "${{ github.event.inputs.environment }}" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          else
+            # ブランチ名から環境を判定
+            BRANCH_NAME="${{ github.ref_name }}"
+            case "$BRANCH_NAME" in
+              "main")
+                ENVIRONMENT="main"
+                ;;
+              "develop")
+                ENVIRONMENT="develop"
+                ;;
+              *)
+                echo "警告: 未知のブランチ '$BRANCH_NAME'。デフォルト環境を使用します。"
+                ENVIRONMENT="main"
+                ;;
+            esac
+          fi
+          
+          echo "選択された環境: $ENVIRONMENT"
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 requests pyyaml
+          # Fastlane for iOS certificate management
+          brew install fastlane
+
+      - name: Get Bundle ID from Xcode project
+        id: get-bundle-id
+        run: |
+          echo "Extracting Bundle ID from Xcode project..."
+          python scripts/extract_bundle_id.py
+        env:
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+
+      - name: Retrieve App Store Connect API credentials
+        id: get-api-credentials
+        run: |
+          echo "Retrieving API credentials from AWS Secrets Manager..."
+          python scripts/get_api_credentials.py
+        env:
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+          APP_STORE_CONNECT_KEY_ID: ${{ steps.get-api-credentials.outputs.key_id }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ steps.get-api-credentials.outputs.issuer_id }}
+          APP_STORE_CONNECT_KEY_PATH: ${{ steps.get-api-credentials.outputs.key_path }}
+
+      - name: Check certificate expiry
+        id: check-expiry
+        run: |
+          echo "Checking certificate expiry date..."
+          python scripts/check_certificate_expiry.py
+        env:
+          FORCE_UPDATE: ${{ github.event.inputs.force_update }}
+          BUNDLE_ID: ${{ steps.get-bundle-id.outputs.bundle_id }}
+          BUNDLE_IDS: ${{ steps.get-bundle-id.outputs.bundle_ids }}
+          APP_STORE_CONNECT_KEY_ID: ${{ steps.get-api-credentials.outputs.key_id }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ steps.get-api-credentials.outputs.issuer_id }}
+          APP_STORE_CONNECT_KEY_PATH: ${{ steps.get-api-credentials.outputs.key_path }}
+
+      - name: Skip update if certificate is valid
+        if: steps.check-expiry.outputs.needs_update == 'false'
+        run: |
+          echo "証明書の有効期限に余裕があります。更新をスキップします。"
+          echo "有効期限: ${{ steps.check-expiry.outputs.expiry_date }}"
+          echo "残り日数: ${{ steps.check-expiry.outputs.days_remaining }}日"
+
+      - name: Update certificates if needed
+        if: steps.check-expiry.outputs.needs_update == 'true'
+        run: |
+          echo "証明書の有効期限が近づいています（残り${{ steps.check-expiry.outputs.days_remaining }}日）"
+          echo "Updating certificates..."
+          python scripts/update_certificates.py
+        env:
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+          BUNDLE_ID: ${{ steps.get-bundle-id.outputs.bundle_id }}
+          BUNDLE_IDS: ${{ steps.get-bundle-id.outputs.bundle_ids }}
+
+      - name: Upload certificates to AWS Secrets Manager
+        if: steps.check-expiry.outputs.needs_update == 'true'
+        run: |
+          echo "Uploading new certificates to AWS Secrets Manager..."
+          python scripts/upload_to_secrets_manager.py
+        env:
+          ENVIRONMENT: ${{ steps.determine-env.outputs.environment }}
+
+      - name: Send success notification
+        if: success() && steps.check-expiry.outputs.needs_update == 'true'
+        run: |
+          python scripts/send_slack_notification.py --status success --message "証明書の更新が正常に完了しました"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+
+      - name: Send failure notification
+        if: failure()
+        run: |
+          python scripts/send_slack_notification.py --status failure --message "証明書の更新に失敗しました"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # リトライジョブ
+  retry-update:
+    needs: check-and-update-certificates
+    if: failure()
+    runs-on: macos-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        attempt: [1, 2, 3]
+    steps:
+      - name: Wait before retry
+        run: |
+          echo "Waiting before retry attempt ${{ matrix.attempt }}..."
+          sleep $((300 * ${{ matrix.attempt }}))  # 5分、10分、15分と増やす
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 requests pyyaml
+          brew install fastlane
+
+      - name: Retry certificate update
+        id: retry-update
+        run: |
+          echo "Retry attempt ${{ matrix.attempt }}..."
+          python scripts/update_certificates.py --retry-attempt ${{ matrix.attempt }}
+
+      - name: Upload certificates to AWS Secrets Manager
+        if: steps.retry-update.outputs.success == 'true'
+        run: |
+          python scripts/upload_to_secrets_manager.py
+
+      - name: Send success notification after retry
+        if: steps.retry-update.outputs.success == 'true'
+        run: |
+          python scripts/send_slack_notification.py --status success --message "証明書の更新が再試行で成功しました (試行: ${{ matrix.attempt }})"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send final failure notification
+        if: failure() && matrix.attempt == 3
+        run: |
+          python scripts/send_slack_notification.py --status failure --message "証明書の更新が3回の試行後も失敗しました。手動での確認が必要です。"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

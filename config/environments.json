@@ -1,0 +1,19 @@
+{
+  "environments": {
+    "main": {
+      "name": "Production",
+      "bundle_id_suffix": "",
+      "secret_name_suffix": "prd",
+      "certificate_name": "Distribution - Production",
+      "slack_channel": "#deployment-prd"
+    },
+    "develop": {
+      "name": "UAT",
+      "bundle_id_suffix": ".uat",
+      "secret_name_suffix": "uat",
+      "certificate_name": "Distribution - UAT",
+      "slack_channel": "#deployment-uat"
+    }
+  },
+  "default_environment": "main"
+}
